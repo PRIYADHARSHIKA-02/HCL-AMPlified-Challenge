@@ -1,0 +1,10 @@
+# Ignore dataset folder
+c215051c-6-Archive 4/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
