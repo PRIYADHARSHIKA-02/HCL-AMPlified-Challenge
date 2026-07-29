@@ -1,13 +1,20 @@
 """
 Personalized Learning Path Recommender
-Strategy: TF-IDF + Cosine Similarity (optimized from 63.99 baseline)
+Strategy: Course prediction + TF-IDF (v4)
 
-Improvements over baseline:
-  1. Course name repeated 3x in train features (boosts course-topic signal)
-  2. Trigrams (1,3) instead of bigrams — captures longer review phrases
-  3. max_features=60K (was 30K) — richer vocabulary
-  4. min_df=1 — keeps all course-specific technical terms
-  5. float32 + dense matmul — faster CPU computation
+Key insight:
+  Train features = course name + review (strong signal)
+  Test features  = review only (missing course name → weaker signal)
+
+Fix: predict course for each test review using a fast classifier,
+     then inject predicted course into test features.
+     This closes the feature gap between train and test.
+
+Score history:
+  v1 baseline (TF-IDF bigrams 30K):                   63.99
+  v2 optimized (TF-IDF trigrams 60K course boost x3):  67.57
+  v3 BM25:                                             55.68  (worse, reverted)
+  v4 course prediction + TF-IDF (this):                TBD
 """
 
 import pandas as pd
@@ -16,6 +23,7 @@ import re
 import time
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import normalize
+from sklearn.linear_model import LogisticRegression
 
 DATA_DIR    = r"c:\Users\rithu\OneDrive\Desktop\HCL AMPlified Challenge\c215051c-6-Archive 4"
 OUTPUT_PATH = r"c:\Users\rithu\OneDrive\Desktop\HCL AMPlified Challenge\submission.csv"
@@ -24,6 +32,8 @@ BATCH_SIZE  = 500
 TOP_K       = 10
 
 # ─────────────────────────────────────────────
+# 1. Load
+# ─────────────────────────────────────────────
 print("Loading data...")
 train  = pd.read_csv(f"{DATA_DIR}/train.csv")
 test   = pd.read_csv(f"{DATA_DIR}/test.csv")
@@ -31,28 +41,68 @@ sample = pd.read_csv(f"{DATA_DIR}/sample_submission.csv")
 print(f"  Train: {train.shape},  Test: {test.shape}")
 
 # ─────────────────────────────────────────────
+# 2. Clean
+# ─────────────────────────────────────────────
 def clean(text: str) -> str:
     if not isinstance(text, str): return ""
     text = text.lower()
     text = re.sub(r"[^a-z0-9\s]", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
-print("Building features...")
-# Repeat course name 3x so course-specific terms dominate TF-IDF weights
-train["feat"] = (train["Course"].apply(clean) + " ") * 3 + train["Reviews"].apply(clean)
-test["feat"]  = test["Reviews"].apply(clean)
-print(f"  Sample train feat: {train['feat'].iloc[0][:120]}")
+# ─────────────────────────────────────────────
+# 3. Predict course for test reviews
+# ─────────────────────────────────────────────
+print("\nStep 1: Predicting course for each test review...")
+t0 = time.time()
+
+clf_vec = TfidfVectorizer(
+    ngram_range=(1, 2),
+    max_features=30_000,
+    sublinear_tf=True,
+    min_df=2,
+    strip_accents="unicode",
+    dtype=np.float32,
+)
+X_train_clf = clf_vec.fit_transform(train["Reviews"].apply(clean))
+X_test_clf  = clf_vec.transform(test["Reviews"].apply(clean))
+
+clf = LogisticRegression(
+    max_iter=1000,
+    C=5.0,
+    solver="saga",
+    n_jobs=-1,
+    multi_class="multinomial",
+)
+clf.fit(X_train_clf, train["Course"])
+
+train_acc = clf.score(X_train_clf, train["Course"])
+test_pred_courses = clf.predict(X_test_clf)
+
+print(f"  Classifier train accuracy : {train_acc:.3f}")
+print(f"  Sample predictions        : {test_pred_courses[:5].tolist()}")
+print(f"  Done [{time.time()-t0:.1f}s]")
 
 # ─────────────────────────────────────────────
-print("\nFitting TF-IDF...")
+# 4. Build features — both train and test now have course name
+# ─────────────────────────────────────────────
+print("\nStep 2: Building TF-IDF features...")
 t0 = time.time()
+
+# Train: true course name 3x + review
+train["feat"] = (train["Course"].apply(clean) + " ") * 3 + train["Reviews"].apply(clean)
+
+# Test: predicted course name 3x + review  ← closes the feature gap
+test["feat"]  = (pd.Series(test_pred_courses).apply(clean) + " ") * 3 + test["Reviews"].apply(clean)
+
+print(f"  Train sample: {train['feat'].iloc[0][:100]}")
+print(f"  Test  sample: {test['feat'].iloc[0][:100]}")
 
 vec = TfidfVectorizer(
     analyzer="word",
-    ngram_range=(1, 3),       # trigrams for richer phrase coverage
-    max_features=60_000,      # larger vocab
+    ngram_range=(1, 3),
+    max_features=60_000,
     sublinear_tf=True,
-    min_df=1,                 # keep rare course-specific terms
+    min_df=1,
     max_df=0.95,
     strip_accents="unicode",
     dtype=np.float32,
@@ -63,7 +113,9 @@ test_tfidf  = normalize(vec.transform(test["feat"]),      norm="l2")
 print(f"  train: {train_tfidf.shape}, test: {test_tfidf.shape}  [{time.time()-t0:.1f}s]")
 
 # ─────────────────────────────────────────────
-print("\nComputing top-10 (batch sparse multiply)...")
+# 5. Top-10 by cosine similarity
+# ─────────────────────────────────────────────
+print(f"\nStep 3: Computing top-{TOP_K} recommendations...")
 t0 = time.time()
 
 train_idx = train["Index"].values
@@ -73,8 +125,7 @@ n_test    = test_tfidf.shape[0]
 for start in range(0, n_test, BATCH_SIZE):
     end   = min(start + BATCH_SIZE, n_test)
     batch = test_tfidf[start:end]
-
-    sim = (batch @ train_tfidf.T).toarray()
+    sim   = (batch @ train_tfidf.T).toarray()
 
     for i, row in enumerate(sim):
         top = np.argpartition(row, -TOP_K)[-TOP_K:]
@@ -89,6 +140,8 @@ for start in range(0, n_test, BATCH_SIZE):
 
 print(f"  Done. Total: {time.time()-t0:.1f}s")
 
+# ─────────────────────────────────────────────
+# 6. Build & validate submission
 # ─────────────────────────────────────────────
 print("\nBuilding submission...")
 submission = pd.DataFrame(results, columns=["Index", "Index_list"])

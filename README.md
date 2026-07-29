@@ -4,58 +4,71 @@ An NLP-based recommender system designed to suggest personalized learning paths 
 
 ## Achievement
 
-| Submission | Score | Status |
-|---|---|---|
-| Baseline (v1) | `63.99000` | Accepted |
-| Optimized (v2) | `67.57000` | Accepted ✅ |
+| Version | Strategy | Score | Status |
+|---|---|---|---|
+| v1 | TF-IDF bigrams 30K | `63.99` | Accepted |
+| v2 | TF-IDF trigrams 60K + course boost x3 | `67.57` | Accepted |
+| v3 | BM25 | `55.68` | Accepted (worse) |
+| v4 | Course prediction + TF-IDF | `81.00` | Accepted ✅ |
 
 ---
 
 ## Strategy & Technical Approach
 
-The core recommendation strategy leverages text mining and similarity matching:
+### v4 — Course Prediction + TF-IDF (Current Best: 81.00)
 
-### v2 — Optimized TF-IDF (Current Best: 67.57)
+**Key Insight:**
+- Train features = `course name + review` (strong signal)
+- Test features = `review only` (missing course name → weaker signal)
+- **Fix:** Predict the course for each test review, then inject it into test features — closes the feature gap between train and test.
 
-1. **Text Preprocessing:**
-   - Normalizing text to lowercase.
-   - Removing special characters, punctuation, and digits.
-   - Collapsing duplicate whitespaces.
+**Pipeline:**
 
-2. **Feature Engineering:**
-   - Course name repeated **3×** in train features to boost course-topic signal in TF-IDF weights.
-   - Test features use review text only (mirrors real test conditions — no course name available).
-   - Feature representations built using **TF-IDF Vectorizer** with:
-     - **Trigrams (1–3)** instead of bigrams — captures longer review phrases
-     - **60,000 max features** (was 30K) — richer vocabulary coverage
-     - `min_df=1` — retains rare but course-specific technical terms
-     - `sublinear_tf=True`, `strip_accents="unicode"`, `float32` dtype
-   - Features are $L_2$-normalized to yield unit vectors for cosine similarity.
+1. **Course Prediction (Step 1)**
+   - Train a `LogisticRegression` classifier (`C=5.0, solver=saga, multinomial`) on TF-IDF bigram features of train reviews
+   - Achieves **100% train accuracy** — reviews are clearly course-distinct
+   - Predict course label for every test review
 
-3. **Similarity & Retrieval:**
-   - Cosine similarity computed between test queries and train feature matrix in batches (batch size = 500).
-   - **NumPy `argpartition`** extracts top-10 closest matches efficiently per review, sorted descending by similarity.
+2. **Feature Construction (Step 2)**
+   - Train: `predicted_course × 3 + review` (true course name repeated 3×)
+   - Test: `predicted_course × 3 + review` (predicted course name repeated 3×)
+   - Both sides now have the same feature structure
+
+3. **TF-IDF Vectorization (Step 3)**
+   - `ngram_range=(1, 3)` — trigrams for richer phrase coverage
+   - `max_features=60,000` — larger vocabulary
+   - `min_df=1` — keeps rare course-specific technical terms
+   - `sublinear_tf=True`, L2-normalized
+
+4. **Similarity & Retrieval (Step 4)**
+   - Batch cosine similarity (batch size = 500)
+   - `numpy argpartition` for efficient top-10 extraction per test review
+
+---
+
+### v2 — Optimized TF-IDF (Score: 67.57)
+- Course name repeated 3× in train features
+- Trigrams (1–3), 60K features, min_df=1
+- Test features: review only (no course name)
 
 ### v1 — Baseline TF-IDF (Score: 63.99)
-
-- Course name + review as train features (bigrams, 30K features, min_df=2)
+- Course name + review as train features (bigrams, 30K features)
 - Review-only test features
-- Cosine similarity with batch processing
 
 ---
 
 ## Repository Structure
 
 ```
-├── recommender.py          # Main model — optimized TF-IDF recommendation logic
-├── recommender.ipynb       # Jupyter notebook version of recommender.py
+├── recommender.py          # Main pipeline — course prediction + TF-IDF
+├── recommender.ipynb       # Jupyter notebook version
 ├── validate.py             # Format/shape check validation helper
-├── submission.csv          # Generated test predictions (10,977 test items)
+├── submission.csv          # Generated predictions (10,977 test items)
 ├── source_code.zip         # Zipped source for portal upload
 └── README.md               # Documentation
 ```
 
-> Note: The dataset folder `c215051c-6-Archive 4` is omitted from this repository due to size constraints.
+> Note: Dataset folder `c215051c-6-Archive 4` omitted due to size constraints.
 
 ---
 
@@ -69,29 +82,24 @@ pip install pandas numpy scikit-learn
 
 ### Execution
 
-1. Run the recommendation script to generate predictions:
-   ```bash
-   python recommender.py
-   ```
-   Or open and run `recommender.ipynb` in Jupyter.
+```bash
+python recommender.py
+```
 
-2. Verify the output format and submission shape:
-   ```bash
-   python validate.py
-   ```
+Or open `recommender.ipynb` in Jupyter and run all cells.
 
 ### Expected Output
-- `submission.csv` with 10,977 rows
-- Each row contains `Index` and `Index_list` (exactly 10 recommended train indices)
-- Runtime: ~10 minutes on CPU
+- `submission.csv` — 10,977 rows, 2 columns (`Index`, `Index_list`)
+- Each `Index_list` contains exactly 10 recommended train indices
+- Runtime: ~15 min on CPU
 
 ---
 
 ## Results Progression
 
 ```
-63.99  →  67.57
- v1          v2
+63.99  →  67.57  →  55.68  →  81.00
+  v1        v2        v3        v4 ✅
 ```
 
 Target: **90+**
