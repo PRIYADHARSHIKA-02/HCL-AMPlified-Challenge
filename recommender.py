@@ -1,131 +1,191 @@
 """
 Personalized Learning Path Recommender
-Strategy: Course prediction + TF-IDF (v4 - BEST SCORE: 81.00)
+HCL AMPlified Challenge
 
-*** THIS IS THE BEST PERFORMING VERSION — DO NOT MODIFY ***
+Approach:
+    Two-stage pipeline to recommend the top-10 most similar
+    training reviews for each test review.
 
-Steps:
-  1. Predict course for each test review (LogReg, 100% train accuracy)
-  2. Inject predicted course name 3x into test features
-  3. TF-IDF trigrams 60K features on all 109K train rows
-  4. Batch cosine similarity -> top-10
+    Stage 1 - Course Classification:
+        A Logistic Regression classifier is trained on TF-IDF
+        features of training reviews to predict the course label
+        for each test review. This allows the recommender to inject
+        the predicted course name into the test feature vector,
+        aligning it with the training feature space.
 
-Score history:
-  v1 TF-IDF bigrams 30K:                  63.99
-  v2 TF-IDF trigrams 60K course boost x3: 67.57
-  v3 BM25:                                55.68
-  v4 course prediction flat boost x3:     81.00  <- BEST
-  v5 confidence weighted boost:           80.38
-  v6 course-filtered retrieval:           68.32
-  v7 top-3 LinearSVC injection:           64.07
+    Stage 2 - TF-IDF Cosine Similarity Retrieval:
+        Training features are constructed by prepending the course
+        name (repeated 3 times for emphasis) to the review text.
+        Test features use the predicted course name in the same way.
+        TF-IDF vectors with trigrams are computed and L2-normalised.
+        Cosine similarity is computed in batches to retrieve the
+        top-10 most similar training entries per test query.
+
+Requirements:
+    pip install pandas numpy scikit-learn
 """
 
-import pandas as pd
-import numpy as np
+import os
 import re
 import time
-import os
+
+import numpy as np
+import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import normalize
 from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import normalize
+
+
+# ── Configuration ────────────────────────────────────────────────────────────
 
 DATA_DIR    = r"c:\Users\rithu\OneDrive\Desktop\HCL AMPlified Challenge\c215051c-6-Archive 4"
 OUTPUT_PATH = r"c:\Users\rithu\OneDrive\Desktop\HCL AMPlified Challenge\submission.csv"
-CACHE_PATH  = r"c:\Users\rithu\OneDrive\Desktop\HCL AMPlified Challenge\test_pred_courses.npy"
 
-BATCH_SIZE  = 500
-TOP_K       = 10
-BOOST       = 3    # course name repeated 3x — confirmed best
+TOP_K      = 10
+BATCH_SIZE = 500
+BOOST      = 3   # number of times course name is repeated in feature text
 
-# ─────────────────────────────────────────────
-print("Loading data...")
-train  = pd.read_csv(f"{DATA_DIR}/train.csv")
-test   = pd.read_csv(f"{DATA_DIR}/test.csv")
-sample = pd.read_csv(f"{DATA_DIR}/sample_submission.csv")
-print(f"  Train: {train.shape},  Test: {test.shape}")
 
-def clean(text: str) -> str:
-    if not isinstance(text, str): return ""
+# ── Helper functions ─────────────────────────────────────────────────────────
+
+def clean_text(text: str) -> str:
+    """
+    Normalise text to lowercase, remove non-alphabetic characters,
+    and collapse whitespace.
+    """
+    if not isinstance(text, str):
+        return ""
     text = text.lower()
     text = re.sub(r"[^a-z0-9\s]", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
-# ─────────────────────────────────────────────
-print("\nStep 1: Predicting course for each test review...")
+
+def build_features(reviews: pd.Series, courses: pd.Series, boost: int) -> pd.Series:
+    """
+    Construct feature strings by prepending the course name
+    (repeated `boost` times) to the cleaned review text.
+    """
+    return (courses.apply(clean_text) + " ") * boost + reviews.apply(clean_text)
+
+
+# ── Load data ─────────────────────────────────────────────────────────────────
+
+print("Loading data...")
+train  = pd.read_csv(os.path.join(DATA_DIR, "train.csv"))
+test   = pd.read_csv(os.path.join(DATA_DIR, "test.csv"))
+sample = pd.read_csv(os.path.join(DATA_DIR, "sample_submission.csv"))
+print(f"  Train : {train.shape}")
+print(f"  Test  : {test.shape}")
+print(f"  Courses: {train['Course'].nunique()} unique")
+
+
+# ── Stage 1: Course prediction ────────────────────────────────────────────────
+
+print("\nStage 1: Predicting course labels for test reviews...")
 t0 = time.time()
 
-if os.path.exists(CACHE_PATH):
-    test_pred_courses = np.load(CACHE_PATH, allow_pickle=True)
-    print(f"  Loaded from cache [{time.time()-t0:.1f}s]")
-else:
-    clf_vec = TfidfVectorizer(
-        ngram_range=(1, 2), max_features=30_000,
-        sublinear_tf=True, min_df=2,
-        strip_accents="unicode", dtype=np.float32,
-    )
-    X_train_clf = clf_vec.fit_transform(train["Reviews"].apply(clean))
-    X_test_clf  = clf_vec.transform(test["Reviews"].apply(clean))
-    clf = LogisticRegression(max_iter=1000, C=5.0, solver="saga",
-                             n_jobs=-1, multi_class="multinomial")
-    clf.fit(X_train_clf, train["Course"])
-    train_acc         = clf.score(X_train_clf, train["Course"])
-    test_pred_courses = clf.predict(X_test_clf)
-    np.save(CACHE_PATH, test_pred_courses)
-    print(f"  Train accuracy: {train_acc:.3f}  [{time.time()-t0:.1f}s]")
-
-print(f"  Sample: {test_pred_courses[:3].tolist()}")
-
-# ─────────────────────────────────────────────
-print("\nStep 2: Building features...")
-train["feat"] = (train["Course"].apply(clean) + " ") * BOOST + train["Reviews"].apply(clean)
-test["feat"]  = (pd.Series(test_pred_courses).apply(clean) + " ") * BOOST + test["Reviews"].apply(clean)
-print(f"  Boost: {BOOST}x")
-
-# ─────────────────────────────────────────────
-print("\nStep 3: Fitting TF-IDF...")
-t0 = time.time()
-vec = TfidfVectorizer(
-    analyzer="word", ngram_range=(1, 3),
-    max_features=60_000, sublinear_tf=True,
-    min_df=1, max_df=0.95,
-    strip_accents="unicode", dtype=np.float32,
+clf_vectorizer = TfidfVectorizer(
+    ngram_range=(1, 2),
+    max_features=30_000,
+    sublinear_tf=True,
+    min_df=2,
+    strip_accents="unicode",
+    dtype=np.float32,
 )
-train_tfidf = normalize(vec.fit_transform(train["feat"]), norm="l2")
-test_tfidf  = normalize(vec.transform(test["feat"]),      norm="l2")
-print(f"  train: {train_tfidf.shape}, test: {test_tfidf.shape}  [{time.time()-t0:.1f}s]")
 
-# ─────────────────────────────────────────────
-print(f"\nStep 4: Computing top-{TOP_K}...")
+X_train = clf_vectorizer.fit_transform(train["Reviews"].apply(clean_text))
+X_test  = clf_vectorizer.transform(test["Reviews"].apply(clean_text))
+
+classifier = LogisticRegression(
+    C=5.0,
+    max_iter=1000,
+    solver="saga",
+    multi_class="multinomial",
+    n_jobs=-1,
+)
+classifier.fit(X_train, train["Course"])
+
+train_accuracy    = classifier.score(X_train, train["Course"])
+test_pred_courses = classifier.predict(X_test)
+
+print(f"  Classifier training accuracy : {train_accuracy:.4f}")
+print(f"  Sample predictions           : {test_pred_courses[:3].tolist()}")
+print(f"  Completed in {time.time() - t0:.1f}s")
+
+
+# ── Stage 2: TF-IDF feature construction ──────────────────────────────────────
+
+print("\nStage 2: Building TF-IDF feature vectors...")
 t0 = time.time()
-train_idx = train["Index"].values
-results   = []
-n_test    = test_tfidf.shape[0]
 
-for start in range(0, n_test, BATCH_SIZE):
-    end   = min(start + BATCH_SIZE, n_test)
-    sim   = (test_tfidf[start:end] @ train_tfidf.T).toarray()
-    for i, row in enumerate(sim):
-        top = np.argpartition(row, -TOP_K)[-TOP_K:]
-        top = top[np.argsort(row[top])[::-1]]
-        results.append((test["Index"].iloc[start + i], train_idx[top].tolist()))
+train_features = build_features(train["Reviews"], train["Course"],            BOOST)
+test_features  = build_features(test["Reviews"],  pd.Series(test_pred_courses), BOOST)
+
+tfidf_vectorizer = TfidfVectorizer(
+    analyzer="word",
+    ngram_range=(1, 3),
+    max_features=60_000,
+    sublinear_tf=True,
+    min_df=1,
+    max_df=0.95,
+    strip_accents="unicode",
+    dtype=np.float32,
+)
+
+train_matrix = normalize(tfidf_vectorizer.fit_transform(train_features), norm="l2")
+test_matrix  = normalize(tfidf_vectorizer.transform(test_features),      norm="l2")
+
+print(f"  Train matrix : {train_matrix.shape}")
+print(f"  Test  matrix : {test_matrix.shape}")
+print(f"  Completed in {time.time() - t0:.1f}s")
+
+
+# ── Cosine similarity retrieval ───────────────────────────────────────────────
+
+print(f"\nStage 3: Retrieving top-{TOP_K} recommendations...")
+t0 = time.time()
+
+train_indices = train["Index"].values
+results       = []
+
+for start in range(0, test_matrix.shape[0], BATCH_SIZE):
+    end        = min(start + BATCH_SIZE, test_matrix.shape[0])
+    batch      = test_matrix[start:end]
+    similarity = (batch @ train_matrix.T).toarray()
+
+    for i, scores in enumerate(similarity):
+        top_positions = np.argpartition(scores, -TOP_K)[-TOP_K:]
+        top_positions = top_positions[np.argsort(scores[top_positions])[::-1]]
+        results.append((
+            test["Index"].iloc[start + i],
+            train_indices[top_positions].tolist()
+        ))
+
     if (start // BATCH_SIZE) % 5 == 0:
-        pct = end / n_test * 100
+        pct     = end / test_matrix.shape[0] * 100
         elapsed = time.time() - t0
-        eta = elapsed / end * (n_test - end) if end > 0 else 0
-        print(f"  [{pct:5.1f}%] {end}/{n_test}  elapsed={elapsed:.0f}s  ETA={eta:.0f}s")
+        eta     = (elapsed / end) * (test_matrix.shape[0] - end) if end > 0 else 0
+        print(f"  [{pct:5.1f}%]  {end}/{test_matrix.shape[0]}  "
+              f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s")
 
-print(f"  Done. Total: {time.time()-t0:.1f}s")
+print(f"  Completed in {time.time() - t0:.1f}s")
 
-# ─────────────────────────────────────────────
-print("\nBuilding submission...")
+
+# ── Build and validate submission ─────────────────────────────────────────────
+
+print("\nBuilding submission file...")
 submission = pd.DataFrame(results, columns=["Index", "Index_list"])
 submission["Index_list"] = submission["Index_list"].apply(str)
-assert submission.shape[0] == test.shape[0]
-assert list(submission.columns) == ["Index", "Index_list"]
-assert (submission["Index"].values == test["Index"].values).all()
-lengths = submission["Index_list"].apply(lambda x: len(eval(x)))
-assert (lengths == 10).all()
-print(f"  All checks passed. Shape: {submission.shape}")
+
+assert submission.shape[0] == test.shape[0],                        "Row count mismatch"
+assert list(submission.columns) == ["Index", "Index_list"],         "Column name mismatch"
+assert (submission["Index"].values == test["Index"].values).all(),  "Index order mismatch"
+
+list_lengths = submission["Index_list"].apply(lambda x: len(eval(x)))
+assert (list_lengths == TOP_K).all(), "Some rows do not have exactly 10 recommendations"
+
+print(f"  Validation passed. Shape: {submission.shape}")
 
 submission.to_csv(OUTPUT_PATH, index=False)
-print(f"\nSaved -> {OUTPUT_PATH}")
+print(f"\nSubmission saved to: {OUTPUT_PATH}")
